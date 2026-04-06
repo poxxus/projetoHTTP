@@ -5,7 +5,7 @@ import socket
 #definindo o endereço IP do host
 SERVER_HOST = ""
 #definindo o número da porta em que o servidor irá escutar pelas requisições HTTP
-SERVER_PORT = 80
+SERVER_PORT = 8090
 
 #vamos criar o socket
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -27,75 +27,94 @@ print("Escutando por conexões na porta %s" % SERVER_PORT)
 while True:
     #espera por conexões
     client_connection, client_address = server_socket.accept()
-    client_connection.settimeout(0.5)
+    # Tempo limite para não prender o servidor infinitamente numa conexão silenciosa (Keep-Alive)
+    client_connection.settimeout(10.0)
 
-    #pega a solicitação do cliente (pode ser enviada em vários segmentos TCP)
-    request_data = b""
-    while True:
-        try:
-            chunk = client_connection.recv(4096)
-            if not chunk:
+    try:
+        # Loop do HTTP/1.1: Mantém a conexão aberta esperando múltiplas requisições
+        while True:
+            #pega a solicitação do cliente (pode ser enviada em vários segmentos TCP)
+            request_data = b""
+            while True:
+                try:
+                    chunk = client_connection.recv(4096)
+                    if not chunk:
+                        break
+                    request_data += chunk
+
+                    if b"\r\n\r\n" in request_data:
+                        break
+                except socket.timeout:
+                    break
+
+            # Se não houver dados, o cliente desconectou ou deu timeout. Quebramos o Keep-Alive.
+            if not request_data:
                 break
-            request_data += chunk
-        except socket.timeout:
-            break
 
-    #verifica se a request possui algum conteúdo
-    if request_data:
-        try:
-            #separa cabecalho do corpo para suportar dados binários no post
-            parts = request_data.split(b"\r\n\r\n", 1)
-            headers_part = parts[0].decode("utf-8", errors="replace")
-            body_part = parts[1] if len(parts) > 1 else b""
-            
-            #analisa a solicitação HTTP
-            headers = headers_part.split("\n")
-            #imprime a primeira linha da requisição
-            print(headers[0].strip())
-            
-            request_line = headers[0].strip().split()
-            if len(request_line) >= 2:
-                method = request_line[0]
-                filename = request_line[1]
+            try:
+                #separa cabecalho do corpo para suportar dados binários no post
+                parts = request_data.split(b"\r\n\r\n", 1)
+                headers_part = parts[0].decode("utf-8", errors="replace")
+                body_part = parts[1] if len(parts) > 1 else b""
 
-                #verifica qual arquivo está sendo solicitado
-                if filename == "/":
-                    filename = "/index.html"
+                #analisa a solicitação HTTP
+                headers = headers_part.split("\n")
+                #imprime a primeira linha da requisição
+                print(headers[0].strip())
 
-                #utiliza o diretório raiz atual
-                filepath = "." + filename
+                request_line = headers[0].strip().split()
+                if len(request_line) >= 2:
+                    method = request_line[0]
+                    filename = request_line[1]
 
-                if method == "GET":
-                    #try e except para tratamento de erro quando um arquivo solicitado não existir
-                    try:
-                        #abrir o arquivo em modo binário (para suportar imagens) e enviar para o cliente
-                        fin = open(filepath, "rb")
-                        content = fin.read()
-                        fin.close()
-                        #envia a resposta
-                        response_header = b"HTTP/1.1 200 OK\r\n\r\n"
-                        client_connection.sendall(response_header + content)
-                    except FileNotFoundError:
-                        #caso o arquivo solicitado não exista no servidor, gera uma resposta de erro
-                        response = b"HTTP/1.1 404 NOT FOUND\r\n\r\n<h1>ERROR 404!<br>File Not Found!</h1>"
-                        client_connection.sendall(response)
-                        
-                elif method == "POST":
-                    try:
-                        #criar e armazenar o recurso a partir dos dados da solicitação
-                        fout = open(filepath, "wb")
-                        fout.write(body_part)
-                        fout.close()
-                        response = b"HTTP/1.1 200 OK\r\n\r\n<h1>Salvo com sucesso!</h1><a href='/'>Voltar</a>"
-                        client_connection.sendall(response)
-                    except Exception as e:
-                        response = b"HTTP/1.1 500 INTERNAL SERVER ERROR\r\n\r\n<h1>Erro Interno</h1>"
-                        client_connection.sendall(response)
+                    #verifica qual arquivo está sendo solicitado
+                    if filename == "/":
+                        filename = "/index.html"
 
-        except Exception as e:
-            print("Erro ao processar:", e)
+                    #utiliza o diretório raiz atual
+                    filepath = "." + filename
 
-    client_connection.close()
+                    if method == "GET":
+                        #try e except para tratamento de erro quando um arquivo solicitado não existir
+                        try:
+                            #abrir o arquivo em modo binário (para suportar imagens) e enviar para o cliente
+                            fin = open(filepath, "rb")
+                            content = fin.read()
+                            fin.close()
+                            # Envia a resposta HTTP/1.1 INCLUINDO Content-Length
+                            response_header = f"HTTP/1.1 200 OK\r\nContent-Length: {len(content)}\r\nConnection: keep-alive\r\n\r\n".encode("utf-8")
+                            client_connection.sendall(response_header + content)
+                        except FileNotFoundError:
+                            #caso o arquivo solicitado não exista no servidor, gera uma resposta de erro
+                            erro_body = b"<h1>ERROR 404!<br>File Not Found!</h1>"
+                            response = f"HTTP/1.1 404 NOT FOUND\r\nContent-Length: {len(erro_body)}\r\nConnection: close\r\n\r\n".encode("utf-8") + erro_body
+                            client_connection.sendall(response)
+                            break # Encerre o erro, forçamos o cliente a reconectar
+
+                    elif method == "POST":
+                        try:
+                            #criar e armazenar o recurso a partir dos dados da solicitação
+                            fout = open(filepath, "ab")
+                            fout.write(body_part + b"\n")
+                            fout.close()
+                            sucesso_body = b"<h1>Salvo com sucesso!</h1><a href='/'>Voltar</a>"
+                            response = f"HTTP/1.1 200 OK\r\nContent-Length: {len(sucesso_body)}\r\nConnection: keep-alive\r\n\r\n".encode("utf-8") + sucesso_body
+                            client_connection.sendall(response)
+                        except Exception as e:
+                            erro_body = b"<h1>Erro Interno</h1>"
+                            response = f"HTTP/1.1 500 INTERNAL SERVER ERROR\r\nContent-Length: {len(erro_body)}\r\nConnection: close\r\n\r\n".encode("utf-8") + erro_body
+                            client_connection.sendall(response)
+                            break
+
+            except Exception as e:
+                print("Erro ao processar:", e)
+                break
+
+    except Exception:
+        pass
+    finally:
+        # Fechamento correto da conexão após o término do loop Keep-Alive
+        client_connection.close()
 
 server_socket.close()
 
